@@ -1,10 +1,9 @@
 package pdc;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -42,41 +41,48 @@ public class Message {
      */
     public byte[] pack() {
         validate();
-        try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            DataOutputStream out = new DataOutputStream(baos);
+        byte[] magicBytes = utf8(magic);
+        byte[] typeBytes = utf8(messageType);
+        byte[] studentBytes = utf8(studentId);
+        byte[] payloadBytes = utf8(payload);
 
-            writeString(out, magic);
-            out.writeInt(version);
-            writeString(out, messageType);
-            writeString(out, studentId);
-            out.writeLong(timestamp);
-            writeString(out, payload);
-            out.flush();
-            return baos.toByteArray();
-        } catch (IOException exception) {
-            throw new IllegalStateException("Failed to serialize message", exception);
-        }
+        int totalSize = 4 + magicBytes.length
+                + 4
+                + 4 + typeBytes.length
+                + 4 + studentBytes.length
+                + 8
+                + 4 + payloadBytes.length;
+
+        ByteBuffer buffer = ByteBuffer.allocate(totalSize);
+        putString(buffer, magicBytes);
+        buffer.putInt(version);
+        putString(buffer, typeBytes);
+        putString(buffer, studentBytes);
+        buffer.putLong(timestamp);
+        putString(buffer, payloadBytes);
+        return buffer.array();
     }
 
     /**
      * Reconstructs a Message from a byte stream.
      */
     public static Message unpack(byte[] data) {
-        try {
-            DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
-            Message message = new Message();
-            message.magic = readString(in);
-            message.version = in.readInt();
-            message.messageType = readString(in);
-            message.studentId = readString(in);
-            message.timestamp = in.readLong();
-            message.payload = readString(in);
-            message.validate();
-            return message;
-        } catch (IOException exception) {
-            throw new IllegalArgumentException("Failed to parse message", exception);
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        Message message = new Message();
+        message.magic = getString(buffer);
+        if (buffer.remaining() < 4) {
+            throw new IllegalArgumentException("Incomplete version field");
         }
+        message.version = buffer.getInt();
+        message.messageType = getString(buffer);
+        message.studentId = getString(buffer);
+        if (buffer.remaining() < 8) {
+            throw new IllegalArgumentException("Incomplete timestamp field");
+        }
+        message.timestamp = buffer.getLong();
+        message.payload = getString(buffer);
+        message.validate();
+        return message;
     }
 
     public void validate() {
@@ -97,19 +103,28 @@ public class Message {
         }
     }
 
-    private static void writeString(DataOutputStream out, String value) throws IOException {
-        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-        out.writeInt(bytes.length);
-        out.write(bytes);
+    private static byte[] utf8(String value) {
+        return value.getBytes(StandardCharsets.UTF_8);
     }
 
-    private static String readString(DataInputStream in) throws IOException {
-        int length = in.readInt();
+    private static void putString(ByteBuffer buffer, byte[] bytes) {
+        buffer.putInt(bytes.length);
+        buffer.put(bytes);
+    }
+
+    private static String getString(ByteBuffer buffer) {
+        if (buffer.remaining() < 4) {
+            throw new IllegalArgumentException("Incomplete string length field");
+        }
+        int length = buffer.getInt();
         if (length < 0 || length > MAX_FIELD_BYTES) {
             throw new IllegalArgumentException("Invalid frame length: " + length);
         }
+        if (buffer.remaining() < length) {
+            throw new IllegalArgumentException("Insufficient bytes for field");
+        }
         byte[] bytes = new byte[length];
-        in.readFully(bytes);
+        buffer.get(bytes);
         return new String(bytes, StandardCharsets.UTF_8);
     }
 

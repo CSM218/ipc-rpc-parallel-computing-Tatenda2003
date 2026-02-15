@@ -7,7 +7,6 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -42,11 +41,14 @@ public class Master {
     private final BlockingQueue<TaskContext> pendingTasks = new LinkedBlockingQueue<>();
     private final Map<String, TaskContext> inFlightTasks = new ConcurrentHashMap<>();
     private final Map<String, Set<String>> workerAssignments = new ConcurrentHashMap<>();
+    private final Map<String, TaskContext> deadLetterTasks = new ConcurrentHashMap<>();
     private final AtomicLong sequence = new AtomicLong(0);
 
     private final String studentId =
             System.getenv().getOrDefault("STUDENT_ID", "unknown-student");
     private final long heartbeatTimeoutMs = parseLongEnv("HEARTBEAT_TIMEOUT_MS", 5_000L);
+        private final long taskLeaseTimeoutMs = parseLongEnv("TASK_LEASE_TIMEOUT_MS", 2_500L);
+        private final int reassignmentDepthLimit = parseIntEnv("REASSIGNMENT_DEPTH", 6);
 
     private volatile boolean running;
     private ServerSocket serverSocket;
@@ -166,6 +168,7 @@ public class Master {
     private void schedulerLoop() {
         while (running) {
             try {
+                requeueStaleInFlightTasks();
                 trySchedulePendingTasks();
                 Thread.sleep(20);
             } catch (InterruptedException exception) {
@@ -185,9 +188,7 @@ public class Master {
                     for (String taskId : assigned) {
                         TaskContext task = inFlightTasks.get(taskId);
                         if (task != null) {
-                            task.assignedWorker = null;
-                            task.attempts++;
-                            pendingTasks.offer(task);
+                            requeueWithDepth(task, failedWorkerId + "-heartbeat-timeout");
                         }
                     }
                 }
@@ -199,11 +200,41 @@ public class Master {
         while ((task = reassignmentQueue.poll()) != null) {
             TaskContext failed = inFlightTasks.get(task);
             if (failed != null) {
-                failed.assignedWorker = null;
-                failed.attempts++;
-                pendingTasks.offer(failed);
+                requeueWithDepth(failed, "rpc-task-error");
             }
         }
+    }
+
+    private void requeueStaleInFlightTasks() {
+        long now = System.currentTimeMillis();
+        for (TaskContext task : inFlightTasks.values()) {
+            if (task.assignedWorker == null || task.dispatchedAt <= 0) {
+                continue;
+            }
+            if (now - task.dispatchedAt > taskLeaseTimeoutMs) {
+                Set<String> assigned = workerAssignments.get(task.assignedWorker);
+                if (assigned != null) {
+                    assigned.remove(task.taskId);
+                }
+                deadWorkers.offer(task.assignedWorker);
+                requeueWithDepth(task, "lease-timeout");
+            }
+        }
+    }
+
+    private void requeueWithDepth(TaskContext task, String reason) {
+        if (task == null) {
+            return;
+        }
+        task.assignedWorker = null;
+        task.dispatchedAt = 0L;
+        task.attempts++;
+        if (task.attempts > reassignmentDepthLimit) {
+            inFlightTasks.remove(task.taskId);
+            deadLetterTasks.put(task.taskId, task);
+            return;
+        }
+        pendingTasks.offer(task);
     }
 
     private void handleConnection(Socket socket) {
@@ -314,9 +345,8 @@ public class Master {
                 workerAssignments.computeIfAbsent(selected.workerId,
                         key -> Collections.newSetFromMap(new ConcurrentHashMap<>())).add(task.taskId);
             } catch (Exception exception) {
-                task.attempts++;
-                pendingTasks.offer(task);
                 deadWorkers.offer(selected.workerId);
+                requeueWithDepth(task, "send-failure");
             }
         }
     }
