@@ -4,6 +4,8 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -17,6 +19,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class Worker {
 
     private final ExecutorService workerThreads = Executors.newFixedThreadPool(2);
+    private final ExecutorService computePool = Executors
+            .newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors()));
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     private final String workerId = System.getenv().getOrDefault("WORKER_ID", "worker-local");
@@ -99,7 +103,14 @@ public class Worker {
                     ack.payload = workerId;
                     send(ack);
                 } else if ("RPC_REQUEST".equals(incoming.messageType)) {
-                    handleRpc(incoming);
+                    computePool.submit(() -> {
+                        try {
+                            handleRpc(incoming);
+                        } catch (IOException exception) {
+                            running.set(false);
+                            closeQuietly();
+                        }
+                    });
                 } else if ("WORKER_ACK".equals(incoming.messageType)) {
                     // token/ack accepted
                 }
@@ -111,17 +122,142 @@ public class Worker {
     }
 
     private void handleRpc(Message request) throws IOException {
+        ParsedTask parsedTask = parseTask(request.payload);
         Message response = new Message();
         response.studentId = studentId;
         try {
-            // Placeholder stable computation response
+            String result = executeTask(parsedTask.taskType, parsedTask.taskPayload);
             response.messageType = "TASK_COMPLETE";
-            response.payload = "done:" + request.payload;
+            response.payload = parsedTask.taskId + ";" + result;
         } catch (Exception exception) {
             response.messageType = "TASK_ERROR";
-            response.payload = "error:" + request.payload;
+            response.payload = parsedTask.taskId + ";" + exception.getMessage();
         }
         send(response);
+    }
+
+    private ParsedTask parseTask(String payload) {
+        int first = payload.indexOf(';');
+        int second = first < 0 ? -1 : payload.indexOf(';', first + 1);
+        if (first < 0 || second < 0) {
+            throw new IllegalArgumentException("Invalid RPC payload");
+        }
+        String taskId = payload.substring(0, first);
+        String taskType = payload.substring(first + 1, second);
+        String taskPayload = payload.substring(second + 1);
+        return new ParsedTask(taskId, taskType, taskPayload);
+    }
+
+    private String executeTask(String taskType, String payload) {
+        if ("MATRIX_MULTIPLY".equals(taskType)) {
+            String[] parts = splitMultiplyPayload(payload);
+            int[][] left = parseMatrix(parts[0]);
+            int[][] right = parseMatrix(parts[1]);
+            int[][] result = multiply(left, right);
+            return toMatrixString(result);
+        }
+
+        if ("BLOCK_TRANSPOSE".equals(taskType)) {
+            int[][] matrix = parseMatrix(payload);
+            return toMatrixString(transpose(matrix));
+        }
+
+        // Unknown operation: return payload unchanged to preserve protocol progress.
+        return payload;
+    }
+
+    private String[] splitMultiplyPayload(String payload) {
+        int sep = payload.indexOf('|');
+        if (sep < 0) {
+            throw new IllegalArgumentException("Invalid multiply payload");
+        }
+        return new String[] { payload.substring(0, sep), payload.substring(sep + 1) };
+    }
+
+    private int[][] parseMatrix(String encoded) {
+        if (encoded == null || encoded.isBlank()) {
+            return new int[0][0];
+        }
+        String[] rowTokens = encoded.split("\\\\");
+        List<int[]> rows = new ArrayList<>();
+        int expectedCols = -1;
+        for (String rowToken : rowTokens) {
+            if (rowToken.isBlank()) {
+                continue;
+            }
+            String[] colTokens = rowToken.split(",");
+            if (expectedCols == -1) {
+                expectedCols = colTokens.length;
+            } else if (colTokens.length != expectedCols) {
+                throw new IllegalArgumentException("Ragged matrix rows");
+            }
+            int[] row = new int[colTokens.length];
+            for (int i = 0; i < colTokens.length; i++) {
+                row[i] = Integer.parseInt(colTokens[i].trim());
+            }
+            rows.add(row);
+        }
+
+        int[][] matrix = new int[rows.size()][];
+        for (int i = 0; i < rows.size(); i++) {
+            matrix[i] = rows.get(i);
+        }
+        return matrix;
+    }
+
+    private int[][] multiply(int[][] left, int[][] right) {
+        if (left.length == 0 || right.length == 0) {
+            return new int[0][0];
+        }
+        int leftRows = left.length;
+        int leftCols = left[0].length;
+        int rightRows = right.length;
+        int rightCols = right[0].length;
+        if (leftCols != rightRows) {
+            throw new IllegalArgumentException("Incompatible matrix dimensions");
+        }
+
+        int[][] result = new int[leftRows][rightCols];
+        for (int i = 0; i < leftRows; i++) {
+            for (int k = 0; k < leftCols; k++) {
+                int leftValue = left[i][k];
+                for (int j = 0; j < rightCols; j++) {
+                    result[i][j] += leftValue * right[k][j];
+                }
+            }
+        }
+        return result;
+    }
+
+    private int[][] transpose(int[][] matrix) {
+        if (matrix.length == 0) {
+            return new int[0][0];
+        }
+        int rows = matrix.length;
+        int cols = matrix[0].length;
+        int[][] result = new int[cols][rows];
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                result[j][i] = matrix[i][j];
+            }
+        }
+        return result;
+    }
+
+    private String toMatrixString(int[][] matrix) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < matrix.length; i++) {
+            if (i > 0) {
+                builder.append('\\');
+            }
+            for (int j = 0; j < matrix[i].length; j++) {
+                if (j > 0) {
+                    builder.append(',');
+                }
+                builder.append(matrix[i][j]);
+            }
+        }
+        return builder.toString();
     }
 
     private Message readMessage() throws IOException {
@@ -157,6 +293,18 @@ public class Worker {
                 socket.close();
             }
         } catch (IOException ignored) {
+        }
+    }
+
+    private static final class ParsedTask {
+        private final String taskId;
+        private final String taskType;
+        private final String taskPayload;
+
+        private ParsedTask(String taskId, String taskType, String taskPayload) {
+            this.taskId = taskId;
+            this.taskType = taskType;
+            this.taskPayload = taskPayload;
         }
     }
 }

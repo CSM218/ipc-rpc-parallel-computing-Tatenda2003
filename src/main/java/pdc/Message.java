@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 public class Message {
     public static final String MAGIC = "CSM218";
     public static final int CURRENT_VERSION = 1;
+    private static final int MAX_FIELD_BYTES = 100_000_000;
 
     public String magic;
     public int version;
@@ -104,11 +105,109 @@ public class Message {
 
     private static String readString(DataInputStream in) throws IOException {
         int length = in.readInt();
-        if (length < 0 || length > 10_000_000) {
+        if (length < 0 || length > MAX_FIELD_BYTES) {
             throw new IllegalArgumentException("Invalid frame length: " + length);
         }
         byte[] bytes = new byte[length];
         in.readFully(bytes);
         return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    public String toJson() {
+        validate();
+        return "{"
+                + "\"magic\":\"" + escapeJson(magic) + "\"," 
+                + "\"version\":" + version + ","
+                + "\"messageType\":\"" + escapeJson(messageType) + "\"," 
+                + "\"studentId\":\"" + escapeJson(studentId) + "\"," 
+                + "\"timestamp\":" + timestamp + ","
+                + "\"payload\":\"" + escapeJson(payload) + "\""
+                + "}";
+    }
+
+    public static Message parse(String json) {
+        Message message = new Message();
+        message.magic = extractString(json, "magic", MAGIC);
+        message.version = extractInt(json, "version", CURRENT_VERSION);
+        message.messageType = extractString(json, "messageType", "CONNECT");
+        message.studentId = extractString(json, "studentId", "unknown");
+        message.timestamp = extractLong(json, "timestamp", System.currentTimeMillis());
+        message.payload = extractString(json, "payload", "");
+        message.validate();
+        return message;
+    }
+
+    private static String escapeJson(String value) {
+        return value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
+    }
+
+    private static String unescapeJson(String value) {
+        return value
+                .replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\");
+    }
+
+    private static String extractString(String json, String key, String fallback) {
+        String token = "\"" + key + "\":";
+        int start = json.indexOf(token);
+        if (start < 0) {
+            return fallback;
+        }
+        int firstQuote = json.indexOf('"', start + token.length());
+        if (firstQuote < 0) {
+            return fallback;
+        }
+        int i = firstQuote + 1;
+        boolean escaped = false;
+        StringBuilder buffer = new StringBuilder();
+        while (i < json.length()) {
+            char c = json.charAt(i);
+            if (c == '"' && !escaped) {
+                return unescapeJson(buffer.toString());
+            }
+            buffer.append(c);
+            escaped = c == '\\' && !escaped;
+            if (c != '\\') {
+                escaped = false;
+            }
+            i++;
+        }
+        return fallback;
+    }
+
+    private static int extractInt(String json, String key, int fallback) {
+        try {
+            return (int) extractLong(json, key, fallback);
+        } catch (Exception exception) {
+            return fallback;
+        }
+    }
+
+    private static long extractLong(String json, String key, long fallback) {
+        String token = "\"" + key + "\":";
+        int start = json.indexOf(token);
+        if (start < 0) {
+            return fallback;
+        }
+        int index = start + token.length();
+        while (index < json.length() && Character.isWhitespace(json.charAt(index))) {
+            index++;
+        }
+        int end = index;
+        while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) {
+            end++;
+        }
+        if (end <= index) {
+            return fallback;
+        }
+        return Long.parseLong(json.substring(index, end));
     }
 }

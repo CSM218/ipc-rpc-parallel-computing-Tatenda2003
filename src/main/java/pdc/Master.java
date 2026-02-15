@@ -6,9 +6,12 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -33,8 +36,12 @@ public class Master {
     private final ExecutorService systemThreads = Executors.newCachedThreadPool();
     private final ExecutorService taskPool = Executors.newFixedThreadPool(4);
     private final Map<String, WorkerConnection> workers = new ConcurrentHashMap<>();
+    private final Map<String, ClientConnection> clients = new ConcurrentHashMap<>();
     private final Queue<String> deadWorkers = new ConcurrentLinkedQueue<>();
     private final BlockingQueue<String> reassignmentQueue = new LinkedBlockingQueue<>();
+    private final BlockingQueue<TaskContext> pendingTasks = new LinkedBlockingQueue<>();
+    private final Map<String, TaskContext> inFlightTasks = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> workerAssignments = new ConcurrentHashMap<>();
     private final AtomicLong sequence = new AtomicLong(0);
 
     private final String studentId =
@@ -71,7 +78,7 @@ public class Master {
             tasks.add(() -> {
                 long correlationId = sequence.incrementAndGet();
                 String taskKey = operation + "-" + partitionIndex + "-" + correlationId;
-                reassignmentQueue.offer(taskKey);
+                pendingTasks.offer(new TaskContext(taskKey, operation, encodeMatrix(data), null));
                 return partitionIndex;
             });
         }
@@ -87,7 +94,7 @@ public class Master {
             recoverAndReassign();
         }
 
-        // Keep current unit tests stable; integration grader checks patterns and structure.
+        trySchedulePendingTasks();
         return null;
     }
 
@@ -104,7 +111,7 @@ public class Master {
             while (running) {
                 try {
                     Socket socket = serverSocket.accept();
-                    systemThreads.submit(() -> handleWorker(socket));
+                    systemThreads.submit(() -> handleConnection(socket));
                 } catch (IOException exception) {
                     if (running) {
                         // listener remains resilient; next loop can recover
@@ -114,6 +121,7 @@ public class Master {
         });
 
         systemThreads.submit(this::heartbeatMonitorLoop);
+        systemThreads.submit(this::schedulerLoop);
     }
 
     /**
@@ -155,26 +163,59 @@ public class Master {
         }
     }
 
+    private void schedulerLoop() {
+        while (running) {
+            try {
+                trySchedulePendingTasks();
+                Thread.sleep(20);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
     private void recoverAndReassign() {
         String failedWorkerId;
         while ((failedWorkerId = deadWorkers.poll()) != null) {
             WorkerConnection removed = workers.remove(failedWorkerId);
             if (removed != null) {
+                Set<String> assigned = workerAssignments.remove(failedWorkerId);
+                if (assigned != null) {
+                    for (String taskId : assigned) {
+                        TaskContext task = inFlightTasks.get(taskId);
+                        if (task != null) {
+                            task.assignedWorker = null;
+                            task.attempts++;
+                            pendingTasks.offer(task);
+                        }
+                    }
+                }
                 closeQuietly(removed.socket);
             }
         }
 
         String task;
         while ((task = reassignmentQueue.poll()) != null) {
-            // recovery queue retains tasks for retry/redistribute logic
-            // intentionally simple for scaffolded lab structure
+            TaskContext failed = inFlightTasks.get(task);
+            if (failed != null) {
+                failed.assignedWorker = null;
+                failed.attempts++;
+                pendingTasks.offer(failed);
+            }
         }
     }
 
-    private void handleWorker(Socket socket) {
+    private void handleConnection(Socket socket) {
+        String connectionId = "conn-" + sequence.incrementAndGet();
+        ClientConnection clientConnection = new ClientConnection(connectionId, socket);
+        clients.put(connectionId, clientConnection);
+
         try {
             DataInputStream input = new DataInputStream(socket.getInputStream());
             DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+            clientConnection.input = input;
+            clientConnection.output = output;
 
             while (running && !socket.isClosed()) {
                 Message incoming = readMessage(input);
@@ -182,27 +223,122 @@ public class Master {
 
                 if ("REGISTER_WORKER".equals(incoming.messageType)) {
                     String workerId = incoming.payload;
-                    workers.put(workerId, new WorkerConnection(workerId, socket, input, output));
+                    WorkerConnection worker = new WorkerConnection(workerId, socket, input, output);
+                    workers.put(workerId, worker);
+                    workerAssignments.putIfAbsent(workerId, Collections.newSetFromMap(new ConcurrentHashMap<>()));
 
                     Message ack = new Message();
                     ack.messageType = "WORKER_ACK";
                     ack.studentId = studentId;
                     ack.payload = "CSM218_TOKEN_" + workerId;
-                    send(workers.get(workerId), ack);
+                    send(worker, ack);
                 } else if ("HEARTBEAT".equals(incoming.messageType)) {
                     WorkerConnection conn = workers.get(incoming.payload);
                     if (conn != null) {
                         conn.lastSeen = System.currentTimeMillis();
                     }
+                } else if ("RPC_REQUEST".equals(incoming.messageType)) {
+                    TaskContext task = TaskContext.fromRpcRequest(incoming.payload, connectionId);
+                    if (task != null) {
+                        inFlightTasks.put(task.taskId, task);
+                        pendingTasks.offer(task);
+                    }
                 } else if ("TASK_COMPLETE".equals(incoming.messageType)) {
-                    // result would be aggregated in complete implementation
+                    String[] parts = splitThree(incoming.payload);
+                    if (parts != null) {
+                        String taskId = parts[0];
+                        String result = parts[1];
+                        TaskContext completed = inFlightTasks.remove(taskId);
+                        if (completed != null && completed.assignedWorker != null) {
+                            Set<String> tasks = workerAssignments.get(completed.assignedWorker);
+                            if (tasks != null) {
+                                tasks.remove(taskId);
+                            }
+                            ClientConnection client = clients.get(completed.clientId);
+                            if (client != null) {
+                                Message response = new Message();
+                                response.messageType = "TASK_COMPLETE";
+                                response.studentId = studentId;
+                                response.payload = taskId + ";" + result;
+                                send(client, response);
+                            }
+                        }
+                    }
                 } else if ("TASK_ERROR".equals(incoming.messageType)) {
-                    reassignmentQueue.offer(incoming.payload);
+                    String[] parts = splitThree(incoming.payload);
+                    if (parts != null) {
+                        reassignmentQueue.offer(parts[0]);
+                    }
                 }
             }
         } catch (Exception exception) {
             // connection failure triggers reconcile/recovery through timeout path
+        } finally {
+            clients.remove(connectionId);
+            WorkerConnection detachedWorker = null;
+            for (WorkerConnection worker : workers.values()) {
+                if (worker.socket == socket) {
+                    detachedWorker = worker;
+                    break;
+                }
+            }
+            if (detachedWorker != null) {
+                deadWorkers.offer(detachedWorker.workerId);
+            }
+            closeQuietly(socket);
         }
+    }
+
+    private void trySchedulePendingTasks() {
+        if (workers.isEmpty()) {
+            return;
+        }
+
+        TaskContext task;
+        while ((task = pendingTasks.poll()) != null) {
+            WorkerConnection selected = chooseWorker();
+            if (selected == null) {
+                pendingTasks.offer(task);
+                return;
+            }
+
+            try {
+                Message request = new Message();
+                request.messageType = "RPC_REQUEST";
+                request.studentId = studentId;
+                request.payload = task.taskId + ";" + task.taskType + ";" + task.payload;
+
+                send(selected, request);
+                task.assignedWorker = selected.workerId;
+                task.dispatchedAt = System.currentTimeMillis();
+                workerAssignments.computeIfAbsent(selected.workerId,
+                        key -> Collections.newSetFromMap(new ConcurrentHashMap<>())).add(task.taskId);
+            } catch (Exception exception) {
+                task.attempts++;
+                pendingTasks.offer(task);
+                deadWorkers.offer(selected.workerId);
+            }
+        }
+    }
+
+    private WorkerConnection chooseWorker() {
+        long now = System.currentTimeMillis();
+        WorkerConnection best = null;
+        int bestLoad = Integer.MAX_VALUE;
+
+        for (WorkerConnection worker : workers.values()) {
+            if (now - worker.lastSeen > heartbeatTimeoutMs) {
+                deadWorkers.offer(worker.workerId);
+                continue;
+            }
+            int load = workerAssignments.getOrDefault(worker.workerId, Collections.emptySet()).size();
+            if (load < bestLoad) {
+                best = worker;
+                bestLoad = load;
+            }
+        }
+
+        return best;
     }
 
     private Message readMessage(DataInputStream input) throws IOException {
@@ -222,6 +358,50 @@ public class Master {
             connection.output.write(frame);
             connection.output.flush();
         }
+    }
+
+    private void send(ClientConnection connection, Message message) throws IOException {
+        if (connection.output == null) {
+            throw new IOException("Client output stream unavailable");
+        }
+        byte[] frame = message.pack();
+        synchronized (connection.output) {
+            connection.output.writeInt(frame.length);
+            connection.output.write(frame);
+            connection.output.flush();
+        }
+    }
+
+    private String encodeMatrix(int[][] matrix) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < matrix.length; i++) {
+            if (i > 0) {
+                builder.append('\\');
+            }
+            for (int j = 0; j < matrix[i].length; j++) {
+                if (j > 0) {
+                    builder.append(',');
+                }
+                builder.append(matrix[i][j]);
+            }
+        }
+        return builder.toString();
+    }
+
+    private String[] splitThree(String value) {
+        int first = value.indexOf(';');
+        if (first < 0) {
+            return null;
+        }
+        int second = value.indexOf(';', first + 1);
+        if (second < 0) {
+            return new String[] { value.substring(0, first), value.substring(first + 1), "" };
+        }
+        return new String[] {
+                value.substring(0, first),
+                value.substring(first + 1, second),
+                value.substring(second + 1)
+        };
     }
 
     private int parseIntEnv(String key, int fallback) {
@@ -260,6 +440,47 @@ public class Master {
             this.input = input;
             this.output = output;
             this.lastSeen = System.currentTimeMillis();
+        }
+    }
+
+    private static final class ClientConnection {
+        private final String clientId;
+        private final Socket socket;
+        private volatile DataInputStream input;
+        private volatile DataOutputStream output;
+
+        private ClientConnection(String clientId, Socket socket) {
+            this.clientId = clientId;
+            this.socket = socket;
+        }
+    }
+
+    private static final class TaskContext {
+        private final String taskId;
+        private final String taskType;
+        private final String payload;
+        private final String clientId;
+        private volatile String assignedWorker;
+        private volatile int attempts;
+        private volatile long dispatchedAt;
+
+        private TaskContext(String taskId, String taskType, String payload, String clientId) {
+            this.taskId = taskId;
+            this.taskType = taskType;
+            this.payload = payload;
+            this.clientId = clientId;
+        }
+
+        private static TaskContext fromRpcRequest(String rpcPayload, String clientId) {
+            int first = rpcPayload.indexOf(';');
+            int second = first < 0 ? -1 : rpcPayload.indexOf(';', first + 1);
+            if (first < 0 || second < 0) {
+                return null;
+            }
+            String taskId = rpcPayload.substring(0, first);
+            String taskType = rpcPayload.substring(first + 1, second);
+            String payload = rpcPayload.substring(second + 1);
+            return new TaskContext(taskId, taskType, payload, clientId);
         }
     }
 }
