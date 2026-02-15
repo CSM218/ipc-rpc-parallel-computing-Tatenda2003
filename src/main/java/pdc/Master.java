@@ -1,5 +1,7 @@
 package pdc;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -7,6 +9,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -42,13 +45,14 @@ public class Master {
     private final Map<String, TaskContext> inFlightTasks = new ConcurrentHashMap<>();
     private final Map<String, Set<String>> workerAssignments = new ConcurrentHashMap<>();
     private final Map<String, TaskContext> deadLetterTasks = new ConcurrentHashMap<>();
+    private final Map<String, Integer> reassignmentDepthByTask = new ConcurrentHashMap<>();
     private final AtomicLong sequence = new AtomicLong(0);
 
     private final String studentId =
             System.getenv().getOrDefault("STUDENT_ID", "unknown-student");
     private final long heartbeatTimeoutMs = parseLongEnv("HEARTBEAT_TIMEOUT_MS", 5_000L);
-        private final long taskLeaseTimeoutMs = parseLongEnv("TASK_LEASE_TIMEOUT_MS", 2_500L);
-        private final int reassignmentDepthLimit = parseIntEnv("REASSIGNMENT_DEPTH", 6);
+    private final long taskLeaseTimeoutMs = parseLongEnv("TASK_LEASE_TIMEOUT_MS", 2_500L);
+    private final int reassignmentDepthLimit = parseIntEnv("REASSIGNMENT_DEPTH", 6);
 
     private volatile boolean running;
     private ServerSocket serverSocket;
@@ -226,12 +230,18 @@ public class Master {
         if (task == null) {
             return;
         }
+        if (task.assignedWorker != null) {
+            task.attemptedWorkers.add(task.assignedWorker);
+        }
         task.assignedWorker = null;
         task.dispatchedAt = 0L;
+        task.lastFailureReason = reason;
         task.attempts++;
-        if (task.attempts > reassignmentDepthLimit) {
+        int depth = reassignmentDepthByTask.merge(task.taskId, 1, Integer::sum);
+        if (task.attempts > reassignmentDepthLimit || depth > reassignmentDepthLimit) {
             inFlightTasks.remove(task.taskId);
             deadLetterTasks.put(task.taskId, task);
+            reassignmentDepthByTask.remove(task.taskId);
             return;
         }
         pendingTasks.offer(task);
@@ -243,8 +253,8 @@ public class Master {
         clients.put(connectionId, clientConnection);
 
         try {
-            DataInputStream input = new DataInputStream(socket.getInputStream());
-            DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+            DataInputStream input = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 64 * 1024));
+            DataOutputStream output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 64 * 1024));
             clientConnection.input = input;
             clientConnection.output = output;
 
@@ -285,6 +295,7 @@ public class Master {
                             if (tasks != null) {
                                 tasks.remove(taskId);
                             }
+                            reassignmentDepthByTask.remove(taskId);
                             ClientConnection client = clients.get(completed.clientId);
                             if (client != null) {
                                 Message response = new Message();
@@ -327,7 +338,7 @@ public class Master {
 
         TaskContext task;
         while ((task = pendingTasks.poll()) != null) {
-            WorkerConnection selected = chooseWorker();
+            WorkerConnection selected = chooseWorker(task);
             if (selected == null) {
                 pendingTasks.offer(task);
                 return;
@@ -342,6 +353,8 @@ public class Master {
                 send(selected, request);
                 task.assignedWorker = selected.workerId;
                 task.dispatchedAt = System.currentTimeMillis();
+                task.attemptedWorkers.add(selected.workerId);
+                reassignmentDepthByTask.putIfAbsent(task.taskId, 0);
                 workerAssignments.computeIfAbsent(selected.workerId,
                         key -> Collections.newSetFromMap(new ConcurrentHashMap<>())).add(task.taskId);
             } catch (Exception exception) {
@@ -351,10 +364,12 @@ public class Master {
         }
     }
 
-    private WorkerConnection chooseWorker() {
+    private WorkerConnection chooseWorker(TaskContext task) {
         long now = System.currentTimeMillis();
         WorkerConnection best = null;
+        WorkerConnection fallback = null;
         int bestLoad = Integer.MAX_VALUE;
+        int fallbackLoad = Integer.MAX_VALUE;
 
         for (WorkerConnection worker : workers.values()) {
             if (now - worker.lastSeen > heartbeatTimeoutMs) {
@@ -362,13 +377,17 @@ public class Master {
                 continue;
             }
             int load = workerAssignments.getOrDefault(worker.workerId, Collections.emptySet()).size();
-            if (load < bestLoad) {
+            if (load < fallbackLoad) {
+                fallback = worker;
+                fallbackLoad = load;
+            }
+            if (!task.attemptedWorkers.contains(worker.workerId) && load < bestLoad) {
                 best = worker;
                 bestLoad = load;
             }
         }
 
-        return best;
+        return best != null ? best : fallback;
     }
 
     private Message readMessage(DataInputStream input) throws IOException {
@@ -377,7 +396,14 @@ public class Master {
             throw new IOException("Invalid frame length");
         }
         byte[] frame = new byte[frameLength];
-        input.readFully(frame);
+        int offset = 0;
+        while (offset < frameLength) {
+            int read = input.read(frame, offset, Math.min(8192, frameLength - offset));
+            if (read < 0) {
+                throw new IOException("Stream closed while receiving fragmented TCP frame");
+            }
+            offset += read;
+        }
         return Message.unpack(frame);
     }
 
@@ -490,15 +516,19 @@ public class Master {
         private final String taskType;
         private final String payload;
         private final String clientId;
+        private final Set<String> attemptedWorkers;
         private volatile String assignedWorker;
         private volatile int attempts;
         private volatile long dispatchedAt;
+        private volatile String lastFailureReason;
 
         private TaskContext(String taskId, String taskType, String payload, String clientId) {
             this.taskId = taskId;
             this.taskType = taskType;
             this.payload = payload;
             this.clientId = clientId;
+            this.attemptedWorkers = Collections.synchronizedSet(new HashSet<>());
+            this.lastFailureReason = "none";
         }
 
         private static TaskContext fromRpcRequest(String rpcPayload, String clientId) {

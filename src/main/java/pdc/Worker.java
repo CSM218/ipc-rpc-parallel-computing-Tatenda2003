@@ -1,5 +1,7 @@
 package pdc;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -45,8 +47,8 @@ public class Worker {
 
         try {
             socket = new Socket(host, masterPort);
-            input = new DataInputStream(socket.getInputStream());
-            output = new DataOutputStream(socket.getOutputStream());
+            input = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 64 * 1024));
+            output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 64 * 1024));
             running.set(true);
 
             Message register = new Message();
@@ -266,7 +268,14 @@ public class Worker {
             throw new IOException("Invalid frame length");
         }
         byte[] frame = new byte[frameLength];
-        input.readFully(frame);
+        int offset = 0;
+        while (offset < frameLength) {
+            int read = input.read(frame, offset, Math.min(8192, frameLength - offset));
+            if (read < 0) {
+                throw new IOException("Stream closed while receiving fragmented TCP frame");
+            }
+            offset += read;
+        }
         return Message.unpack(frame);
     }
 

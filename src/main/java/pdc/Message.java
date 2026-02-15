@@ -1,8 +1,5 @@
 package pdc;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
-import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
@@ -18,6 +15,9 @@ public class Message {
     public static final String MAGIC = "CSM218";
     public static final int CURRENT_VERSION = 1;
     private static final int MAX_FIELD_BYTES = 100_000_000;
+    private static final int INITIAL_BUFFER_CAPACITY = 4096;
+    private static final ThreadLocal<byte[]> PACK_BUFFER =
+            ThreadLocal.withInitial(() -> new byte[INITIAL_BUFFER_CAPACITY]);
 
     public String magic;
     public int version;
@@ -53,14 +53,21 @@ public class Message {
                 + 8
                 + 4 + payloadBytes.length;
 
-        ByteBuffer buffer = ByteBuffer.allocate(totalSize);
+        byte[] backing = PACK_BUFFER.get();
+        if (backing.length < totalSize) {
+            backing = new byte[Math.max(totalSize, backing.length * 2)];
+            PACK_BUFFER.set(backing);
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(backing, 0, totalSize);
         putString(buffer, magicBytes);
         buffer.putInt(version);
         putString(buffer, typeBytes);
         putString(buffer, studentBytes);
         buffer.putLong(timestamp);
         putString(buffer, payloadBytes);
-        return buffer.array();
+        byte[] packed = new byte[totalSize];
+        System.arraycopy(backing, 0, packed, 0, totalSize);
+        return packed;
     }
 
     /**
